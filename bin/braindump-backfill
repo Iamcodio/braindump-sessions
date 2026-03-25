@@ -1,0 +1,226 @@
+#!/bin/bash
+# braindump-backfill — Backfill braindump.db from all markdown archive sessions
+# bash 3.2 compatible, sqlite3 CLI only
+
+set -e
+
+DB="/Users/kjd/09-personal/BrainDumpSessions/braindump.db"
+SESSIONS="/Users/kjd/09-personal/BrainDumpSessions/sessions"
+TMPSQL=$(mktemp /tmp/braindump_XXXXXX.sql)
+
+cleanup() { rm -f "$TMPSQL"; }
+trap cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+# sql_escape: double single-quotes for SQLite string literals
+sql_escape() {
+    printf '%s' "$1" | sed "s/'/''/g"
+}
+
+# null_or_quote: emit NULL or 'escaped_value'
+null_or_quote() {
+    if [ -z "$1" ]; then
+        printf 'NULL'
+    else
+        printf "'%s'" "$(sql_escape "$1")"
+    fi
+}
+
+# null_or_int: emit NULL or integer
+null_or_int() {
+    local v
+    v=$(printf '%s' "$1" | grep -oE '^[0-9]+$' | head -1)
+    if [ -z "$v" ]; then printf 'NULL'; else printf '%s' "$v"; fi
+}
+
+# null_or_real: emit NULL or real number
+null_or_real() {
+    local v
+    v=$(printf '%s' "$1" | grep -oE '^[0-9]+(\.[0-9]+)?$' | head -1)
+    if [ -z "$v" ]; then printf 'NULL'; else printf '%s' "$v"; fi
+}
+
+# extract_section FILE PATTERN — returns lines between two ## headers
+# PATTERN is a case-insensitive substring that the header must contain
+extract_section() {
+    local file="$1"
+    local pat
+    pat=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
+    awk -v pat="$pat" '
+        BEGIN { found=0 }
+        /^##[[:space:]]/ {
+            if (found) found=0
+            if (index(tolower($0), pat) > 0) found=1
+            next
+        }
+        found { print }
+    ' "$file"
+}
+
+# ---------------------------------------------------------------------------
+# Per-file processor
+# ---------------------------------------------------------------------------
+
+process_file() {
+    local file="$1"
+    local filename
+    filename=$(basename "$file")
+
+    local date
+    date=$(printf '%s' "$filename" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -1)
+    [ -z "$date" ] && return
+
+    printf 'Processing %s ...\n' "$date"
+
+    # -------------------------------------------------------------------------
+    # BASELINES — parse structured DAILY METRICS block
+    # -------------------------------------------------------------------------
+    local sleep_line energy_line suds_line outlook_line exercise_line medication_line
+
+    sleep_line=$(grep -i '^\*\*Sleep:' "$file" 2>/dev/null | head -1 || true)
+    energy_line=$(grep -i '^\*\*Energy:' "$file" 2>/dev/null | head -1 || true)
+    suds_line=$(grep -i '^\*\*SUDS' "$file" 2>/dev/null | head -1 || true)
+    outlook_line=$(grep -i '^\*\*Outlook:' "$file" 2>/dev/null | head -1 || true)
+    exercise_line=$(grep -i '^\*\*Exercise:' "$file" 2>/dev/null | head -1 || true)
+    medication_line=$(grep -i '^\*\*Medication:' "$file" 2>/dev/null | head -1 || true)
+
+    # sleep_hrs — first number in sleep line (handles "7-8 hours", "0 hours", "7.5 hours")
+    local sleep_hrs
+    sleep_hrs=$(printf '%s' "$sleep_line" | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)
+
+    # sleep_quality — text after "Quality:"
+    local sleep_quality
+    sleep_quality=$(printf '%s' "$sleep_line" | sed 's/.*[Qq]uality:[[:space:]]*//' | sed 's/[[:space:]]*[/|-].*//' | tr -d '\r\n')
+    # If it still contains ** markers it's not a quality value
+    printf '%s' "$sleep_quality" | grep -q '\*\*' && sleep_quality=""
+
+    # energy — first X from "X/5"
+    local energy
+    energy=$(printf '%s' "$energy_line" | grep -oE '[0-9]+/5' | head -1 | cut -d'/' -f1)
+
+    # SUDS — prefer "End: N" value, fall back to first number
+    local suds
+    suds=$(printf '%s' "$suds_line" | grep -oiE 'end:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' | head -1)
+    if [ -z "$suds" ]; then
+        suds=$(printf '%s' "$suds_line" | grep -oE '[0-9]+' | head -1)
+    fi
+
+    # outlook — first X from "X/5"
+    local outlook
+    outlook=$(printf '%s' "$outlook_line" | grep -oE '[0-9]+/5' | head -1 | cut -d'/' -f1)
+
+    # exercise — text after ** marker, before first "/"
+    local exercise
+    exercise=$(printf '%s' "$exercise_line" | sed 's/\*\*[Ee]xercise:\*\*[[:space:]]*//' | cut -d'/' -f1 | tr -d '\r\n' | sed 's/[[:space:]]*$//')
+
+    # medication — everything after ** marker
+    local medication
+    medication=$(printf '%s' "$medication_line" | sed 's/\*\*[Mm]edication:\*\*[[:space:]]*//' | tr -d '\r\n')
+
+    # notes — Key Pattern line if present
+    local notes
+    notes=$(grep -i '^\*\*Key Pattern:' "$file" 2>/dev/null | head -1 | sed 's/\*\*Key Pattern:\*\*[[:space:]]*//' | tr -d '\r\n' || true)
+
+    printf "INSERT OR IGNORE INTO baselines (date, sleep_hrs, sleep_quality, energy, suds, outlook, exercise, medication, notes) VALUES ('%s', %s, %s, %s, %s, %s, %s, %s, %s);\n" \
+        "$date" \
+        "$(null_or_real "$sleep_hrs")" \
+        "$(null_or_quote "$sleep_quality")" \
+        "$(null_or_int "$energy")" \
+        "$(null_or_int "$suds")" \
+        "$(null_or_int "$outlook")" \
+        "$(null_or_quote "$exercise")" \
+        "$(null_or_quote "$medication")" \
+        "$(null_or_quote "$notes")" >> "$TMPSQL"
+
+    # -------------------------------------------------------------------------
+    # ENTRIES — one row per domain section
+    # -------------------------------------------------------------------------
+    local domain_tag section_content escaped_content char_count
+
+    for domain_tag in "mental health:mental_health" "business:business" "personal:personal" "financial:financial" "creative:creative" "actionable:actions" "4d insight:insights"; do
+        local pattern tag
+        pattern=$(printf '%s' "$domain_tag" | cut -d':' -f1)
+        tag=$(printf '%s' "$domain_tag" | cut -d':' -f2)
+
+        section_content=$(extract_section "$file" "$pattern" | tr -d '\r')
+        char_count=$(printf '%s' "$section_content" | wc -c | tr -d ' ')
+
+        if [ "$char_count" -gt 20 ]; then
+            escaped_content=$(printf '%s' "$section_content" | sed "s/'/''/g")
+            printf "INSERT INTO entries (date, raw_text, domain) VALUES ('%s', '%s', '%s');\n" \
+                "$date" "$escaped_content" "$tag" >> "$TMPSQL"
+        fi
+    done
+
+    # -------------------------------------------------------------------------
+    # IDEAS — bold headings from creative section + actionable items
+    # -------------------------------------------------------------------------
+
+    # Creative section: lines starting with ** (subsection titles = concept names)
+    extract_section "$file" "creative" | grep '^\*\*[^*]' | while IFS= read -r idea_line; do
+        local idea_text
+        idea_text=$(printf '%s' "$idea_line" | sed 's/^\*\*//; s/\*\*.*$//' | sed 's/:[[:space:]]*//' | tr -d '\r\n')
+        local idea_len
+        idea_len=$(printf '%s' "$idea_text" | wc -c | tr -d ' ')
+        if [ "$idea_len" -gt 8 ]; then
+            printf "INSERT INTO ideas (date, raw_text, category) VALUES ('%s', '%s', 'creative');\n" \
+                "$date" "$(sql_escape "$idea_text")" >> "$TMPSQL"
+        fi
+    done
+
+    # Business section: bold headings as business ideas
+    extract_section "$file" "business" | grep '^\*\*[^*]' | while IFS= read -r idea_line; do
+        local idea_text
+        idea_text=$(printf '%s' "$idea_line" | sed 's/^\*\*//; s/\*\*.*$//' | sed 's/:[[:space:]]*//' | tr -d '\r\n')
+        local idea_len
+        idea_len=$(printf '%s' "$idea_text" | wc -c | tr -d ' ')
+        if [ "$idea_len" -gt 8 ]; then
+            printf "INSERT INTO ideas (date, raw_text, category) VALUES ('%s', '%s', 'business');\n" \
+                "$date" "$(sql_escape "$idea_text")" >> "$TMPSQL"
+        fi
+    done
+
+    # Actionable items: lines with "- [ ]" checkbox
+    extract_section "$file" "actionable" | grep '^- \[ \]' | while IFS= read -r action_line; do
+        local action_text
+        action_text=$(printf '%s' "$action_line" | sed 's/^- \[ \] *//' | tr -d '\r\n')
+        local action_len
+        action_len=$(printf '%s' "$action_text" | wc -c | tr -d ' ')
+        if [ "$action_len" -gt 5 ]; then
+            printf "INSERT INTO ideas (date, raw_text, category, status) VALUES ('%s', '%s', 'action', 'pending');\n" \
+                "$date" "$(sql_escape "$action_text")" >> "$TMPSQL"
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Main — find and process all archive files
+# ---------------------------------------------------------------------------
+
+printf 'Starting backfill...\n'
+printf 'Database: %s\n' "$DB"
+printf 'Sessions: %s\n\n' "$SESSIONS"
+
+find "$SESSIONS" -name "*brain_dump_archive.md" | sort | while IFS= read -r f; do
+    process_file "$f"
+done
+
+printf '\nExecuting SQL (%d bytes)...\n' "$(wc -c < "$TMPSQL" | tr -d ' ')"
+
+{
+    printf 'BEGIN TRANSACTION;\n'
+    cat "$TMPSQL"
+    printf 'COMMIT;\n'
+} | sqlite3 "$DB"
+
+printf '\nBackfill complete.\n'
+printf 'Row counts:\n'
+sqlite3 "$DB" << 'SQL'
+SELECT 'baselines', COUNT(*) FROM baselines
+UNION ALL SELECT 'entries', COUNT(*) FROM entries
+UNION ALL SELECT 'ideas',   COUNT(*) FROM ideas
+UNION ALL SELECT 'patterns', COUNT(*) FROM patterns;
+SQL

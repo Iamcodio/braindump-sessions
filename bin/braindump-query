@@ -1,0 +1,153 @@
+#!/bin/bash
+# braindump-query — Query the braindump SQLite database
+# Usage:
+#   braindump-query baselines [N]    — last N baselines (default 10)
+#   braindump-query suds             — SUDS trend (all dates with values)
+#   braindump-query ideas [CATEGORY] — all ideas, optional category filter
+#   braindump-query search TERM      — full-text search across entries
+#   braindump-query stats            — overall stats
+#
+# bash 3.2 compatible
+
+DB="/Users/kjd/09-personal/BrainDumpSessions/braindump.db"
+
+if [ ! -f "$DB" ]; then
+    printf 'Error: database not found at %s\n' "$DB" >&2
+    exit 1
+fi
+
+cmd="$1"
+shift || true
+
+case "$cmd" in
+
+  baselines)
+    n="${1:-10}"
+    sqlite3 -column -header "$DB" << SQL
+SELECT
+  date,
+  COALESCE(CAST(sleep_hrs AS TEXT), '-')   AS sleep_hrs,
+  COALESCE(sleep_quality, '-')             AS quality,
+  COALESCE(CAST(energy AS TEXT), '-')      AS energy,
+  COALESCE(CAST(suds AS TEXT), '-')        AS suds,
+  COALESCE(CAST(outlook AS TEXT), '-')     AS outlook,
+  COALESCE(exercise, '-')                  AS exercise
+FROM baselines
+ORDER BY date DESC
+LIMIT $n;
+SQL
+    ;;
+
+  suds)
+    printf 'SUDS trend (most recent first):\n\n'
+    sqlite3 -column -header "$DB" << 'SQL'
+SELECT
+  date,
+  suds,
+  CASE
+    WHEN suds IS NULL         THEN '(no data)'
+    WHEN suds <= 2            THEN '██ low'
+    WHEN suds <= 4            THEN '████ moderate'
+    WHEN suds <= 6            THEN '██████ elevated'
+    WHEN suds <= 8            THEN '████████ high'
+    ELSE                           '██████████ severe'
+  END AS level
+FROM baselines
+WHERE suds IS NOT NULL
+ORDER BY date DESC;
+SQL
+    ;;
+
+  ideas)
+    category="${1:-}"
+    if [ -n "$category" ]; then
+        sqlite3 -column -header "$DB" \
+            "SELECT id, date, category, status, substr(raw_text,1,80) AS idea FROM ideas WHERE category='$category' ORDER BY date DESC;"
+    else
+        sqlite3 -column -header "$DB" << 'SQL'
+SELECT id, date, category, status, substr(raw_text,1,80) AS idea
+FROM ideas
+ORDER BY date DESC;
+SQL
+    fi
+    ;;
+
+  search)
+    term="${1:-}"
+    if [ -z "$term" ]; then
+        printf 'Usage: braindump-query search TERM\n' >&2
+        exit 1
+    fi
+    printf 'Searching for: %s\n\n' "$term"
+    sqlite3 -column -header "$DB" \
+        "SELECT date, domain, substr(raw_text,1,120) AS snippet FROM entries WHERE raw_text LIKE '%${term}%' ORDER BY date DESC LIMIT 50;"
+    printf '\n--- Also in ideas ---\n\n'
+    sqlite3 -column -header "$DB" \
+        "SELECT date, category, status, substr(raw_text,1,120) AS idea FROM ideas WHERE raw_text LIKE '%${term}%' ORDER BY date DESC LIMIT 20;"
+    ;;
+
+  stats)
+    sqlite3 -column -header "$DB" << 'SQL'
+SELECT 'Total sessions' AS metric, COUNT(*) AS value FROM baselines
+UNION ALL
+SELECT 'Sessions with SUDS data', COUNT(*) FROM baselines WHERE suds IS NOT NULL
+UNION ALL
+SELECT 'Sessions with sleep data', COUNT(*) FROM baselines WHERE sleep_hrs IS NOT NULL
+UNION ALL
+SELECT 'Total entries', COUNT(*) FROM entries
+UNION ALL
+SELECT 'Total ideas', COUNT(*) FROM ideas
+UNION ALL
+SELECT 'Pending actions', COUNT(*) FROM ideas WHERE status='pending'
+UNION ALL
+SELECT 'Date range (first)', MIN(date) FROM baselines
+UNION ALL
+SELECT 'Date range (last)',  MAX(date) FROM baselines;
+
+SELECT '' AS metric, '' AS value;
+
+SELECT 'Avg SUDS (all time)' AS metric, ROUND(AVG(suds),1) AS value FROM baselines WHERE suds IS NOT NULL
+UNION ALL
+SELECT 'Avg SUDS (last 30 days)', ROUND(AVG(suds),1) FROM baselines WHERE suds IS NOT NULL AND date >= date('now','-30 days')
+UNION ALL
+SELECT 'Avg energy (all time)', ROUND(AVG(energy),1) FROM baselines WHERE energy IS NOT NULL
+UNION ALL
+SELECT 'Avg sleep hrs (all time)', ROUND(AVG(sleep_hrs),1) FROM baselines WHERE sleep_hrs IS NOT NULL;
+
+SELECT '' AS metric, '' AS value;
+
+SELECT 'Ideas by category' AS metric, category || ': ' || COUNT(*) AS value
+FROM ideas
+GROUP BY category
+ORDER BY COUNT(*) DESC;
+
+SELECT '' AS metric, '' AS value;
+
+SELECT 'Entries by domain' AS metric, domain || ': ' || COUNT(*) AS value
+FROM entries
+GROUP BY domain
+ORDER BY COUNT(*) DESC;
+SQL
+    ;;
+
+  *)
+    cat << 'USAGE'
+braindump-query — Query the BrainDump database
+
+Commands:
+  baselines [N]        Last N baseline records (default: 10)
+  suds                 SUDS anxiety trend across all sessions
+  ideas [CATEGORY]     List ideas (categories: creative, business, action)
+  search TERM          Full-text search across entries and ideas
+  stats                Database overview and averages
+
+Examples:
+  braindump-query baselines 5
+  braindump-query suds
+  braindump-query ideas creative
+  braindump-query search "matrix"
+  braindump-query stats
+USAGE
+    exit 1
+    ;;
+esac

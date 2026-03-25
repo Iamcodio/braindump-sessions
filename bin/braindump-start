@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# braindump-start — Launch isolated braindump/PA session
+# Sonnet 4.6, own Discord server, own bot token
+# COMPLETELY SEPARATE from caveman
+set -euo pipefail
+
+SESSION="braindump"
+BD_DIR="$HOME/09-personal/BrainDumpSessions"
+ENV_FILE="$BD_DIR/.env"
+
+if [ ! -f "$ENV_FILE" ]; then
+    echo "ERROR: No .env file at $ENV_FILE"
+    exit 1
+fi
+source "$ENV_FILE"
+
+if [ -z "${BRAINDUMP_BOT_TOKEN:-}" ]; then
+    echo "ERROR: BRAINDUMP_BOT_TOKEN not set in $ENV_FILE"
+    exit 1
+fi
+
+# Kill existing session if running
+tmux kill-session -t "$SESSION" 2>/dev/null || true
+
+# Ensure PATH has claude
+export PATH="$HOME/.local/bin:$HOME/.nvm/versions/node/$(ls "$HOME/.nvm/versions/node/" 2>/dev/null | tail -1)/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+# Launch in tmux — own bot token, own server, own context
+TMUX= tmux new-session -d -s "$SESSION" \
+  "DISCORD_BOT_TOKEN='$BRAINDUMP_BOT_TOKEN' claude --model claude-sonnet-4-6 --channels plugin:discord@claude-plugins-official --dangerously-skip-permissions --add-dir $HOME/09-personal; exec bash"
+
+echo "Braindump session started in tmux '$SESSION'"
+echo "Attach: tmux attach -t $SESSION"

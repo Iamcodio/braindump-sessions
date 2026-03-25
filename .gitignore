@@ -1,9 +1,24 @@
+# Secrets
 .env
+
+# Database (personal data — stays local + RecoveryStaging backup)
 *.db
 *.db-shm
 *.db-wal
+
+# Sessions (personal braindump archives — PRIVATE, never pushed)
+sessions/
+
+# Archives (migration data — PRIVATE)
+archives/
+
+# Python
 __pycache__/
 .venv/
 *.pyc
+
+# macOS
 .DS_Store
-archives/migration/
+
+# Vector DB (1.1GB, personal)
+vector_db/

@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# braindump-vault — Encrypted backup of personal data to RecoveryStaging
+set -euo pipefail
+
+BD_DIR="$HOME/09-personal/BrainDumpSessions"
+DEST="/Volumes/RecoveryStaging/braindump-vault"
+TODAY=$(date +%Y-%m-%d)
+VAULT_FILE="$DEST/$TODAY.vault"
+TMP_TAR="/tmp/braindump-backup-$TODAY.tar.gz"
+
+if [ ! -d "/Volumes/RecoveryStaging" ]; then
+    echo "ERROR: RecoveryStaging not mounted"
+    exit 1
+fi
+
+mkdir -p "$DEST"
+
+echo "Creating encrypted vault backup..."
+
+# Tar up personal data
+tar czf "$TMP_TAR" \
+    -C "$BD_DIR" \
+    braindump.db \
+    sessions/ \
+    .env \
+    archives/ \
+    2>/dev/null
+
+# Encrypt with AES-256
+# Try keychain first, fall back to prompt
+PASS=$(security find-generic-password -s "braindump-vault" -w 2>/dev/null || echo "")
+if [ -z "$PASS" ]; then
+    echo "No keychain password found. Set one with:"
+    echo "  security add-generic-password -s 'braindump-vault' -a '$USER' -w 'YOUR_PASSWORD'"
+    echo "Falling back to interactive prompt..."
+    openssl enc -aes-256-cbc -pbkdf2 -salt -in "$TMP_TAR" -out "$VAULT_FILE"
+else
+    openssl enc -aes-256-cbc -pbkdf2 -salt -in "$TMP_TAR" -out "$VAULT_FILE" -pass "pass:$PASS"
+fi
+
+rm -f "$TMP_TAR"
+
+SIZE=$(ls -lh "$VAULT_FILE" | awk '{print $5}')
+echo "Vault created: $VAULT_FILE ($SIZE)"
+echo "Decrypt with: openssl enc -d -aes-256-cbc -pbkdf2 -in $VAULT_FILE -out backup.tar.gz"

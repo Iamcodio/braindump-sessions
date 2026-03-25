@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# braindump-backup — Backup private braindump data to RecoveryStaging
+# Backs up: braindump.db, sessions/, archives/, .env
+set -euo pipefail
+
+SRC="$HOME/09-personal/BrainDumpSessions"
+DEST="/Volumes/RecoveryStaging/braindump-backup/$(date +%Y-%m-%d)"
+
+if [ ! -d "/Volumes/RecoveryStaging" ]; then
+    echo "ERROR: RecoveryStaging not mounted"
+    exit 1
+fi
+
+mkdir -p "$DEST"
+echo "Backing up to: $DEST"
+
+cp "$SRC/braindump.db" "$DEST/" 2>/dev/null && echo "  braindump.db"
+cp -r "$SRC/sessions/" "$DEST/sessions/" 2>/dev/null && echo "  sessions/"
+cp -r "$SRC/archives/" "$DEST/archives/" 2>/dev/null && echo "  archives/"
+cp "$SRC/.env" "$DEST/.env" 2>/dev/null && echo "  .env"
+
+SIZE=$(du -sh "$DEST" | cut -f1)
+echo "Done — $SIZE backed up to $DEST"

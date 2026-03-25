@@ -22,3 +22,5 @@ __pycache__/
 
 # Vector DB (1.1GB, personal)
 vector_db/
+bot.log
+Medical Notes/

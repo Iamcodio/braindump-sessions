@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# braindump-monthly — Monthly concatenation + report generation
+# Generalised from concat_february.sh
+set -euo pipefail
+
+BD_DIR="$HOME/09-personal/BrainDumpSessions"
+MONTH="${1:-$(date +%Y-%m)}"
+SESSIONS_DIR="$BD_DIR/sessions/$MONTH"
+TEMPLATE="$BD_DIR/templates/end_of_month_prompt.md"
+
+export PATH="$HOME/.local/bin:$HOME/.nvm/versions/node/$(ls "$HOME/.nvm/versions/node/" 2>/dev/null | tail -1)/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+if [ ! -d "$SESSIONS_DIR" ]; then
+    echo "No sessions directory for $MONTH at $SESSIONS_DIR"
+    exit 1
+fi
+
+MONTH_NAME=$(date -j -f "%Y-%m" "$MONTH" "+%B %Y" 2>/dev/null || echo "$MONTH")
+CONCAT_FILE="$SESSIONS_DIR/${MONTH}_concatenated.md"
+REPORT_FILE="$SESSIONS_DIR/${MONTH}_monthly_report.md"
+
+echo "Processing $MONTH_NAME..."
+
+# Step 1: Concatenate all daily archives
+echo "# $MONTH_NAME - All Brain Dump Sessions" > "$CONCAT_FILE"
+echo "" >> "$CONCAT_FILE"
+echo "Generated: $(date)" >> "$CONCAT_FILE"
+echo "" >> "$CONCAT_FILE"
+echo "---" >> "$CONCAT_FILE"
+
+COUNT=0
+for file in "$SESSIONS_DIR"/${MONTH}-*_brain_dump_archive.md; do
+    if [ -f "$file" ]; then
+        echo "" >> "$CONCAT_FILE"
+        echo "---" >> "$CONCAT_FILE"
+        echo "" >> "$CONCAT_FILE"
+        cat "$file" >> "$CONCAT_FILE"
+        COUNT=$((COUNT + 1))
+    fi
+done
+
+echo "Concatenated $COUNT daily archives into $CONCAT_FILE"
+
+if [ "$COUNT" -eq 0 ]; then
+    echo "No archives found for $MONTH. Nothing to report."
+    exit 0
+fi
+
+# Step 2: Generate monthly report via claude
+CONCAT_CONTENT=$(cat "$CONCAT_FILE" | head -c 50000)  # Cap at 50k chars for context
+TEMPLATE_CONTENT=""
+[ -f "$TEMPLATE" ] && TEMPLATE_CONTENT=$(cat "$TEMPLATE")
+
+RESULT=$(claude -p "Generate the $MONTH_NAME monthly brain dump report from these $COUNT daily sessions:
+
+$CONCAT_CONTENT" \
+    --model claude-sonnet-4-6 \
+    --output-format json \
+    --dangerously-skip-permissions \
+    --max-turns 1 \
+    --append-system-prompt "$TEMPLATE_CONTENT" 2>/dev/null)
+
+REPORT=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('result',''))" 2>/dev/null)
+
+if [ -n "$REPORT" ]; then
+    echo "$REPORT" > "$REPORT_FILE"
+    echo "Monthly report: $REPORT_FILE"
+else
+    echo "WARNING: No report generated"
+fi
+
+# Step 3: Generate PDF if pandoc available
+if command -v pandoc &>/dev/null; then
+    echo "Generating PDF..."
+    bash "$BD_DIR/sessions/generate_monthly_pdf.sh" "$MONTH" 2>/dev/null && echo "PDF generated" || echo "PDF generation failed (non-critical)"
+else
+    echo "pandoc not found — skipping PDF generation"
+fi
+
+echo "Monthly processing complete for $MONTH_NAME."

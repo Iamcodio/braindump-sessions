@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# braindump-eod — End of day processor (standalone, no caveman dependency)
+# Reads today's entries from braindump.db, classifies via 4D framework,
+# saves archive + exchange files
+set -euo pipefail
+
+BD_DIR="$HOME/09-personal/BrainDumpSessions"
+DB="$BD_DIR/braindump.db"
+TODAY=$(date +%Y-%m-%d)
+MONTH=$(date +%Y-%m)
+ARCHIVE_DIR="$BD_DIR/sessions/$MONTH"
+EXCHANGE_DIR="$HOME/caveman/collab/braindump-exchange"
+EOD_TEMPLATE="$BD_DIR/templates/end_of_day_prompt.md"
+
+export PATH="$HOME/.local/bin:$HOME/.nvm/versions/node/$(ls "$HOME/.nvm/versions/node/" 2>/dev/null | tail -1)/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+mkdir -p "$ARCHIVE_DIR" "$EXCHANGE_DIR/summaries" "$EXCHANGE_DIR/ideas" "$EXCHANGE_DIR/tasks"
+
+# Extract today's entries
+ENTRIES=$(sqlite3 "$DB" "SELECT timestamp, raw_text FROM entries WHERE date='$TODAY' ORDER BY created_at ASC;" 2>/dev/null)
+BASELINES=$(sqlite3 "$DB" "SELECT * FROM baselines WHERE date='$TODAY' ORDER BY id DESC LIMIT 1;" 2>/dev/null)
+
+if [ -z "$ENTRIES" ]; then
+    echo "No entries for $TODAY. Nothing to process."
+    exit 0
+fi
+
+ENTRY_COUNT=$(sqlite3 "$DB" "SELECT COUNT(*) FROM entries WHERE date='$TODAY';")
+echo "Processing $ENTRY_COUNT entries for $TODAY..."
+
+# Build EOD prompt
+EOD_PROMPT="Process today's brain dump ($TODAY). $ENTRY_COUNT entries.\n\n"
+EOD_PROMPT+="--- TODAY'S ENTRIES ---\n$ENTRIES\n\n"
+[ -n "$BASELINES" ] && EOD_PROMPT+="--- BASELINE DATA ---\n$BASELINES\n\n"
+
+# Load EOD template if exists
+TEMPLATE=""
+[ -f "$EOD_TEMPLATE" ] && TEMPLATE=$(cat "$EOD_TEMPLATE")
+
+# Run classification via claude -p (haiku for speed/cost)
+RESULT=$(claude -p "$EOD_PROMPT" \
+    --model claude-haiku-4-5-20251001 \
+    --output-format json \
+    --dangerously-skip-permissions \
+    --max-turns 1 \
+    --append-system-prompt "$TEMPLATE
+
+OUTPUT FORMAT: Create a markdown archive with these sections:
+- DAILY METRICS (sleep, SUDS, energy, outlook, medication)
+- MENTAL HEALTH DOMAIN
+- BUSINESS/TECHNICAL DOMAIN
+- PERSONAL/SOCIAL DOMAIN
+- FINANCIAL/TASKS DOMAIN
+- CREATIVE/IDEAS DOMAIN
+- ACTIONABLE ITEMS (HIGH/MEDIUM/LOW priority)
+- 4D INSIGHTS WITH COORDINATES (Clarity, Impact, Actionable, Universal)
+- DAILY SUMMARY
+ASCII ONLY - no emojis." 2>/dev/null)
+
+# Extract result text
+ARCHIVE_TEXT=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('result',''))" 2>/dev/null)
+
+if [ -z "$ARCHIVE_TEXT" ]; then
+    echo "ERROR: No result from claude"
+    exit 1
+fi
+
+# Save archive
+ARCHIVE_FILE="$ARCHIVE_DIR/${TODAY}_brain_dump_archive.md"
+echo "$ARCHIVE_TEXT" > "$ARCHIVE_FILE"
+echo "Archive saved: $ARCHIVE_FILE"
+
+# Extract summary for exchange (first 500 chars of daily summary section)
+SUMMARY=$(echo "$ARCHIVE_TEXT" | sed -n '/DAILY SUMMARY/,/^---/p' | head -20)
+[ -n "$SUMMARY" ] && echo "# Daily Summary - $TODAY\n\n$SUMMARY" > "$EXCHANGE_DIR/summaries/$TODAY.md"
+
+# Extract actionable items for exchange
+TASKS=$(echo "$ARCHIVE_TEXT" | sed -n '/ACTIONABLE ITEMS/,/^---/p' | grep '^\- \[' || true)
+[ -n "$TASKS" ] && echo "# Tasks - $TODAY\n\n$TASKS" > "$EXCHANGE_DIR/tasks/$TODAY.md"
+
+echo "EOD complete for $TODAY."
+echo "  Archive: $ARCHIVE_FILE"
+echo "  Exchange: $EXCHANGE_DIR/summaries/$TODAY.md"

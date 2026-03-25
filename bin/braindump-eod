@@ -28,34 +28,37 @@ fi
 ENTRY_COUNT=$(sqlite3 "$DB" "SELECT COUNT(*) FROM entries WHERE date='$TODAY';")
 echo "Processing $ENTRY_COUNT entries for $TODAY..."
 
-# Build EOD prompt
-EOD_PROMPT="Process today's brain dump ($TODAY). $ENTRY_COUNT entries.\n\n"
-EOD_PROMPT+="--- TODAY'S ENTRIES ---\n$ENTRIES\n\n"
-[ -n "$BASELINES" ] && EOD_PROMPT+="--- BASELINE DATA ---\n$BASELINES\n\n"
+# Write prompt to temp file (avoids bash mangling special chars)
+PROMPT_FILE=$(mktemp)
+echo "Process today's brain dump ($TODAY). $ENTRY_COUNT entries." > "$PROMPT_FILE"
+echo "" >> "$PROMPT_FILE"
+echo "--- TODAY'S ENTRIES ---" >> "$PROMPT_FILE"
+echo "$ENTRIES" >> "$PROMPT_FILE"
+echo "" >> "$PROMPT_FILE"
+[ -n "$BASELINES" ] && echo "--- BASELINE DATA ---" >> "$PROMPT_FILE" && echo "$BASELINES" >> "$PROMPT_FILE"
 
 # Load EOD template if exists
 TEMPLATE=""
 [ -f "$EOD_TEMPLATE" ] && TEMPLATE=$(cat "$EOD_TEMPLATE")
 
-# Run classification via claude -p (haiku for speed/cost)
-RESULT=$(claude -p "$EOD_PROMPT" \
-    --model claude-haiku-4-5-20251001 \
+# Build system prompt file
+SYSTEM_FILE=$(mktemp)
+cat > "$SYSTEM_FILE" << 'SYSEOF'
+This is a headless claude -p call. Do NOT use antArtifact XML tags or filesystem tools.
+Output the complete markdown archive directly as plain text. ASCII ONLY — no emojis.
+SYSEOF
+[ -n "$TEMPLATE" ] && echo "$TEMPLATE" >> "$SYSTEM_FILE"
+
+# Run classification via claude -p
+PROMPT_TEXT=$(cat "$PROMPT_FILE")
+SYSTEM_TEXT=$(cat "$SYSTEM_FILE")
+RESULT=$(claude -p "$PROMPT_TEXT" \
+    --model claude-sonnet-4-6 \
     --output-format json \
     --dangerously-skip-permissions \
-    --max-turns 1 \
-    --append-system-prompt "$TEMPLATE
-
-OUTPUT FORMAT: Create a markdown archive with these sections:
-- DAILY METRICS (sleep, SUDS, energy, outlook, medication)
-- MENTAL HEALTH DOMAIN
-- BUSINESS/TECHNICAL DOMAIN
-- PERSONAL/SOCIAL DOMAIN
-- FINANCIAL/TASKS DOMAIN
-- CREATIVE/IDEAS DOMAIN
-- ACTIONABLE ITEMS (HIGH/MEDIUM/LOW priority)
-- 4D INSIGHTS WITH COORDINATES (Clarity, Impact, Actionable, Universal)
-- DAILY SUMMARY
-ASCII ONLY - no emojis." 2>/dev/null)
+    --max-turns 5 \
+    --append-system-prompt "$SYSTEM_TEXT" 2>/dev/null)
+rm -f "$PROMPT_FILE" "$SYSTEM_FILE"
 
 # Extract result text
 ARCHIVE_TEXT=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('result',''))" 2>/dev/null)

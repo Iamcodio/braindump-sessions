@@ -32,7 +32,7 @@ class ClaudeSession:
             "-p", message,
             "--output-format", "json",
             "--dangerously-skip-permissions",
-            "--max-turns", "1",
+            "--max-turns", "100",
             "--model", self.model,
         ]
         if system_prompt:

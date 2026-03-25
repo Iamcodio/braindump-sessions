@@ -9,6 +9,7 @@ import asyncio
 import logging
 import os
 import signal
+import subprocess
 import sys
 from pathlib import Path
 
@@ -38,11 +39,26 @@ if not TOKEN:
     print("ERROR: BRAINDUMP_BOT_TOKEN not set in .env")
     sys.exit(1)
 
-# Load system prompt
-ROGERIAN_PROMPT = ""
-rogerian_path = BD_DIR / "config" / "rogerian-listener-system.md"
-if rogerian_path.exists():
-    ROGERIAN_PROMPT = rogerian_path.read_text(errors="replace")
+# Load system prompts from templates
+_rogerian_path = BD_DIR / "config" / "rogerian-listener-system.md"
+_brain_dump_path = BD_DIR / "templates" / "brain_dump_prompt.md"
+_time_mgmt_path = BD_DIR / "templates" / "time_management_prompt.md"
+
+ROGERIAN_PROMPT = _rogerian_path.read_text(errors="replace") if _rogerian_path.exists() else ""
+BRAIN_DUMP_PROMPT = _brain_dump_path.read_text(errors="replace") if _brain_dump_path.exists() else ""
+TIME_MGMT_PROMPT = _time_mgmt_path.read_text(errors="replace") if _time_mgmt_path.exists() else ""
+
+# Combined session system prompt: Rogerian listener + brain dump rules + memory categories
+SYSTEM_PROMPT = ROGERIAN_PROMPT
+if BRAIN_DUMP_PROMPT:
+    SYSTEM_PROMPT += "\n\n---\n\n" + BRAIN_DUMP_PROMPT
+
+# Keywords that trigger time management rule injection
+_TIME_MGMT_KEYWORDS = (
+    "appointment", "meeting", "reminder", "calendar", "schedule",
+    "task", "todo", "to-do", "to do", "call", "deadline", "block",
+    "morning routine", "sleep block",
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -72,6 +88,8 @@ claude = ClaudeSession(model="claude-sonnet-4-6")
 threads = ThreadManager()
 
 MAX_MSG = 1980  # Discord 2000 char limit with margin
+EOD_BIN = str(BD_DIR / "bin" / "braindump-eod")
+EOD_TRIGGERS = ("end of day", "eod", "run eod")
 
 
 async def send_chunked(target, text: str):
@@ -118,6 +136,32 @@ async def on_message(message: discord.Message):
 
     log.info("[#%s] %s: %s", getattr(message.channel, "name", "?"), message.author.name, text[:100])
 
+    # EOD trigger: run braindump-eod as subprocess
+    text_lower = text.lower()
+    if any(t in text_lower for t in EOD_TRIGGERS):
+        target = message.channel
+        if message.channel.id == BRAINDUMP_CHANNEL:
+            target = await threads.ensure_daily_thread(message.channel)
+        await target.send("Running end of day processing...")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                EOD_BIN,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=300)
+            output = stdout.decode(errors="replace").strip()
+            if proc.returncode == 0:
+                await send_chunked(target, f"EOD complete:\n```\n{output}\n```")
+            else:
+                await send_chunked(target, f"EOD failed (exit {proc.returncode}):\n```\n{output}\n```")
+        except asyncio.TimeoutError:
+            await target.send("EOD timed out after 5 minutes.")
+        except Exception as exc:
+            log.error("EOD error: %s", exc)
+            await target.send(f"EOD error: {exc}")
+        return
+
     # Get or create daily thread for braindump channel
     target = message.channel
     if message.channel.id == BRAINDUMP_CHANNEL:
@@ -125,7 +169,12 @@ async def on_message(message: discord.Message):
 
     # Build context
     context = await db.get_today_context(n=10)
-    system = ROGERIAN_PROMPT
+    system = SYSTEM_PROMPT
+
+    # Inject time management rules when the message contains scheduling/task keywords
+    if TIME_MGMT_PROMPT and any(kw in text_lower for kw in _TIME_MGMT_KEYWORDS):
+        system += "\n\n--- TIME MANAGEMENT RULES ---\n" + TIME_MGMT_PROMPT
+
     if context:
         system += f"\n\n--- TODAY'S CONVERSATION SO FAR ---\n{context}"
 
